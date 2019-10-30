@@ -895,3 +895,368 @@ cssp_connect(char *server, char *user, char *domain, char *password, STREAM s)
 	s_free(pubkey_cmp);
 	return False;
 }
+
+
+
+const uint32 NtLmNegotiate = 0x01;
+const uint32 NtLmChallenge = 0x02;
+const uint32 NtLmAuthenticate = 0x03;
+
+// See 2.2.2.5 NEGOTIATE
+const uint32 NTLMSSP_NEGOTIATE_56 = 0x80000000;
+const uint32 NTLMSSP_NEGOTIATE_KEY_EXCH = 0x40000000;
+const uint32 NTLMSSP_NEGOTIATE_128 = 0x20000000;
+const uint32 r1 = 0;
+const uint32 r2 = 0;
+const uint32 r3 = 0;
+const uint32 NTLMSSP_NEGOTIATE_VERSION = 0x02000000;
+const uint32 r4 = 0;
+
+const uint32 NTLMSSP_NEGOTIATE_TARGET_INFO = 0x00800000;
+const uint32 NTLMSSP_REQUEST_NON_NT_SESSION_KEY = 0x00400000;
+const uint32 r5 = 0;
+const uint32 NTLMSSP_NEGOTIATE_IDENTIFY = 0x00100000;
+const uint32 NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY = 0x00080000;
+const uint32 r6 = 0;
+const uint32 NTLMSSP_TARGET_TYPE_SERVER = 0x00020000;
+const uint32 NTLMSSP_TARGET_TYPE_DOMAIN = 0x00010000;
+
+const uint32 NTLMSSP_NEGOTIATE_ALWAYS_SIGN = 0x00008000;
+const uint32 r7 = 0;
+const uint32 NTLMSSP_NEGOTIATE_OEM_WORKSTATION_SUPPLIED	= 0x00002000;
+const uint32 NTLMSSP_NEGOTIATE_OEM_DOMAIN_SUPPLIED = 0x00001000;
+const uint32 J = 0x00000800;
+const uint32 r8 = 0;
+const uint32 NTLMSSP_NEGOTIATE_NTLM = 0x00000200;
+const uint32 r9 = 0;
+
+const uint32 NTLMSSP_NEGOTIATE_LM_KEY = 0x00000080;
+const uint32 NTLMSSP_NEGOTIATE_DATAGRAM = 0x00000040;
+const uint32 NTLMSSP_NEGOTIATE_SEAL = 0x00000020;
+const uint32 NTLMSSP_NEGOTIATE_SIGN = 0x00000010;
+const uint32 r10 = 0;
+const uint32 NTLMSSP_REQUEST_TARGET = 0x00000004;
+const uint32 NTLM_NEGOTIATE_OEM = 0x00000002;
+const uint32 NTLMSSP_NEGOTIATE_UNICODE = 0x00000001;
+
+STREAM ntlm_create_negotiate_message(char* domain, char* workstation, bool connectionLess)
+{
+	STREAM out;
+	int length;
+	
+	// first calculate the length
+	length += 8;	// Signature
+	length += 4;	// MessageType
+	length += 4;	// NegotiateFlags
+	length += 8;	// DomainNameFields
+	length += 8;	// WorkstationFields
+	
+	uint32 negotiateFlag = ntlm_create_negotiate_flags_negotiate_message();
+	
+	// TODO: might need some character encoding stuff here. 2 bytes per char maybe?
+	int domainNameLen = 0;
+	if (domain)
+	{
+		negotiateFlag |= NTLMSSP_NEGOTIATE_OEM_DOMAIN_SUPPLIED;
+		domainNameLen = strlen(domain);
+	}
+	
+	int workstationNameLen = 0;
+	if (workstationName)
+	{
+		negotiateFlag |= NTLMSSP_NEGOTIATE_OEM_WORKSTATION_SUPPLIED;
+		workstationNameLen = strlen(workstation);
+	}
+	
+	length += domainNameLen;
+	length += workstationNameLen;
+	
+	if (negotiateFlag & NTLMSSP_NEGOTIATE_VERSION)
+	{
+		length += 8;
+	}
+	
+	int constantPartLength = length;
+	
+	// Allocate the stream
+	out = s_alloc(length);
+	
+	// MS-NLMP Section 2.2
+	
+	// Signature
+	out_uint8(out, 'N');
+	out_uint8(out, 'T');
+	out_uint8(out, 'L');
+	out_uint8(out, 'M');
+	out_uint8(out, 'S');
+	out_uint8(out, 'S');
+	out_uint8(out, 'P');
+	out_uint8(out, '\0');
+	
+	// MessageType
+	out_uint32(out, NtLmNegotiate);
+	
+	// NegotiateFlags
+	if (connectionLess)
+	{
+		negotiateFlag |= NTLMSSP_NEGOTIATE_DATAGRAM
+	}
+	
+	out_uint32(negotiateFlag);
+	
+	// DomainNameFields
+	out_uint32(out, domainNameLen); // DomainNameLen
+	out_uint32(out, domainNameLen); // DomainNameMaxLen
+	
+	out_uint32(out, constantPartLength); // DomainNameBufferOffset
+	
+	// WorkstationFields
+	out_uint32(out, workstationNameLen); // WorkstationLen
+	out_uint32(out, workstationNameLen); // WorkstationMaxLen
+	
+	out_uint32(out, constantPartLength + domainNameLen); // WorkstationBufferOffset
+	
+	// Payload
+	if (domainNameLen > 0)
+	{
+		out_utf16s(out, domain); // DomainName
+	}
+	
+	if (workstationNameLen > 0)
+	{
+		out_utf16s(out, workstation); // WorkstationName
+	}
+	
+	// Version
+	if (negotiateFlag & NTLMSSP_NEGOTIATE_VERSION)
+	{
+		out_uint32(out, 0x00000000);
+		out_uint32(out, 0x00000000);
+	}
+	
+	return out;
+}
+
+bool AssertNextChar(Stream s, char expectedValue)
+{
+	char readChar;
+	in_uint8(s, readChar);
+	if (readChar != expectedValue)
+	{
+		// TODO: report some kind of error
+		return 0;
+	}
+	
+	return 1;
+}
+
+bool AssertNextUint32(Stream s, uint32 expectedValue)
+{
+	char readValue;
+	in_uint32(s, readValue);
+	if (readChar != expectedValue)
+	{
+		// TODO: report some kind of error
+		return 0;
+	}
+	
+	return 1;
+}
+
+STREAM ntlm_reply_to_challenge_message(Stream s, int totalLength, uint32 originalNegotiateFlag)
+{
+	uint length = 48;
+	if (totalLength < length)
+	{
+		// TODO: report some kind of error
+		return NULL;
+	}
+	
+	// Signature
+	if (!AssertNextChar(s, 'N')
+		|| !AssertNextChar(s, 'T')
+		|| !AssertNextChar(s, 'L')
+		|| !AssertNextChar(s, 'M')
+		|| !AssertNextChar(s, 'S')
+		|| !AssertNextChar(s, 'S')
+		|| !AssertNextChar(s, 'P')
+		|| !AssertNextChar(s, '\0'))
+	{
+		return NULL;
+	}
+	
+	// MessageType
+	if (!AssertNextUint32(s, NtLmChallenge))
+	{
+		return NULL;
+	}
+	
+	// TargetNameFields
+	uint16 TargetNameLen, TargetNameMaxLen;
+	in_uint16(s, TargetNameLen);
+	in_uint16(s, TargetNameMaxLen);
+	uint32 TargetNameBufferOffset;
+	in_uint32(s, TargetNameBufferOffset);
+	
+	if (originalNegotiateFlag & NTLMSSP_REQUEST_TARGET)
+	{
+		if (TargetNameLen == 0 || TargetNameBufferOffset == 0)
+		{
+			// TODO: report some kind of error
+			return NULL;
+		}
+		
+		if (originalNegotiateFlag & NTLMSSP_NEGOTIATE_UNICODE && (TargetNameBufferOffset % 2 != 0 || TargetNameLen % 2 != 0))
+		{
+			// TODO: report some kind of error
+			return NULL;
+		}
+	}
+	
+	// NegotiateFlags
+	uint32 negotiateFlag;
+	in_uint32(s, negotiateFlag);
+	
+	// ServerChallenge
+	byte ServerChallenge[8];
+	ServerChallenge = in_uint8s(s, 8); // TODO: I'm pretty sure that's not how I consume the stream;
+	
+	// Reserved
+	if (!AssertNextUint32(s, 0)
+		|| !AssertNextUint32(s, 0))
+	{
+		// TODO: report some kind of error
+		return NULL;
+	}
+	
+	// TargetInfoFields
+	uint16 TargetInfoLen, TargetInfoMaxLen;
+	in_uint16(s, TargetInfoLen);
+	in_uint16(s, TargetInfoMaxLen);
+	uint32 TargetInfoBufferOffset;
+	in_uint32(s, TargetInfoBufferOffset);
+	
+	// Version
+	for(int i = 0; i < 8; i++)
+	{
+		uint32 ignore;
+		in_uint8(s, ignore);
+	}
+	
+	// Payload
+	Stream targetNameStream;
+	Stream targetInfoStream;
+	
+	if (TargetInfoLen > 0 && TargetInfoBufferOffset <= TargetNameBufferOffset)
+	{
+		uint32 skip = TargetInfoBufferOffset - length;
+		length = TargetInfoBufferOffset + TargetInfoLen;
+		if (totalLength < length)
+		{
+			// TODO: report some kind of error
+			return NULL;	
+		}
+		
+		for(int i = 0; i < skip; i++)
+		{
+			uint8 ignore;
+			in_uint8(s, ignore);
+		}
+		
+		out_uint8stream(targetInfoStream, s, TargetInfoLen);
+	}
+	
+	if (TargetNameLen > 0)
+	{
+		uint32 skip = TargetNameBufferOffset - length;
+		length = TargetNameBufferOffset + TargetNameLen
+		if (totalLength < length)
+		{
+			// TODO: report some kind of error
+			return NULL;	
+		}
+		
+		for(int i = 0; i < skip; i++)
+		{
+			uint8 ignore;
+			in_uint8(s, ignore);
+		}
+		
+		out_uint8stream(targetNameStream, s, TargetNameLen);
+	}
+	
+	if (TargetInfoLen > 0 && TargetInfoBufferOffset > TargetNameBufferOffset)
+	{
+		uint32 skip = TargetInfoBufferOffset - length;
+		length = TargetInfoBufferOffset + TargetInfoLen
+		if (totalLength < length)
+		{
+			// TODO: report some kind of error
+			return NULL;	
+		}
+		
+		for(int i = 0; i < skip; i++)
+		{
+			uint8 ignore;
+			in_uint8(s, ignore);
+		}
+		
+		out_uint8stream(targetInfoStream, s, TargetInfoLen);
+	}
+	
+	// TODO: Validate the contents of the AV_PAIRs
+	// 2.2.2.1 - Some are required, the sequence must end with MsvAvEOL
+	
+	// TODO: If present, validate the name in targetNameStream
+	// If the target is in a domain, it should be the domain name.
+	// Otherwise, it should be the server name.
+	
+	Stream out;
+	
+	uint32 out_length = 0;
+	out_length += 8; // Signature
+	out_length += 4; // MessageType
+	out_length += 8; // LmChallengeResponseFields
+	out_length += 8; // NtChallengeResponseFields
+	out_length += 8; // DomainNameFields
+	out_length += 8; // UserNameFields
+	out_length += 8; // WorkstationFields
+	out_length += 8; // EncryptedRandomSessionKeyFields
+	out_length += 4; // NegotiateFlags
+	out_length += 8; // Version
+	out_length += 16; // MIC
+	
+	// TODO: calculate the length of Payload
+	// 
+	uint32 payload;
+	out_length += payload;
+	
+	// TODO: build the response
+	
+	
+	
+	
+	
+	return out;
+}
+	
+uint ntlm_create_negotiate_flags_negotiate_message()
+{
+	uint32 result = 
+		// chosing to omit 56 bit encryption
+		NTLMSSP_NEGOTIATE_KEY_EXCH 
+		| NTLMSSP_NEGOTIATE_128
+		// NTLMSSP_NEGOTIATE_VERSION set separately if at all
+
+		//| NTLMSSP_NEGOTIATE_IDENTIFY // TODO: has to do with GSS_C_IDENTIFY_FLAG, which may come from credssp
+
+		// NTLMSSP_NEGOTIATE_OEM_WORKSTATION_SUPPLIED set separately
+		// NTLMSSP_NEGOTIATE_OEM_DOMAIN_SUPPLIED set separately
+
+		| NTLMSSP_NEGOTIATE_LM_KEY // Use NTLMv2 only
+		// NTLMSSP_NEGOTIATE_DATAGRAM set separately
+		| NTLMSSP_NEGOTIATE_SEAL
+		| NTLMSSP_NEGOTIATE_SIGN
+		| NTLMSSP_REQUEST_TARGET
+		| NTLM_NEGOTIATE_OEM;
+}
